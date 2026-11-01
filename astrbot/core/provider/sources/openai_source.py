@@ -1103,9 +1103,23 @@ class ProviderOpenAIOfficial(Provider):
                     "to remove. Reduce attachments, tool output, or prompt size."
                 )
                 raise e
-            # Remove a complete old turn so tool calls and results stay together.
-            # Keep instructions and the latest user turn, including its attachments.
-            next_user_index = user_indices[1]
+            # Halve context bytes rather than dropping one turn per API request:
+            # long multimodal histories can otherwise exhaust the retry budget.
+            # Keep instructions and the latest turn, including tool calls/results.
+            message_sizes = [
+                len(json.dumps(record, ensure_ascii=False).encode("utf-8"))
+                if record.get("role") not in {"system", "developer"}
+                else 0
+                for record in context_query
+            ]
+            remaining_size = sum(message_sizes)
+            target_size = remaining_size // 2
+            previous_index = 0
+            for removed_turns, next_user_index in enumerate(user_indices[1:], start=1):
+                remaining_size -= sum(message_sizes[previous_index:next_user_index])
+                previous_index = next_user_index
+                if remaining_size <= target_size:
+                    break
             context_query[:] = [
                 record
                 for idx, record in enumerate(context_query)
@@ -1115,7 +1129,11 @@ class ProviderOpenAIOfficial(Provider):
             payloads["messages"] = context_query
             logger.warning(
                 "Request body exceeds the provider limit (HTTP 413). "
-                "Removed the oldest conversation turn before retrying."
+                "Removed %d oldest conversation turn(s) before retrying; "
+                "non-instruction context reduced from %d to %d bytes.",
+                removed_turns,
+                sum(message_sizes),
+                remaining_size,
             )
             return (
                 False,

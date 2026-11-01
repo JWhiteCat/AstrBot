@@ -264,7 +264,7 @@ async def test_request_body_too_large_retries_without_old_turns(monkeypatch, str
 
     async def fake_query(payloads, tools, **kwargs):
         attempts.append(copy.deepcopy(payloads["messages"]))
-        if len(attempts) < 3:
+        if len(attempts) < 2:
             raise error
         return LLMResponse(role="assistant", completion_text="ok")
 
@@ -284,10 +284,68 @@ async def test_request_body_too_large_retries_without_old_turns(monkeypatch, str
             assert response.completion_text == "ok"
         assert attempts == [
             original_contexts,
-            [original_contexts[0], *original_contexts[4:]],
             [original_contexts[0], original_contexts[4], *original_contexts[7:]],
         ]
         assert contexts == original_contexts
+    finally:
+        await provider.terminate()
+
+
+@pytest.mark.asyncio
+async def test_request_body_error_trims_long_history_by_bytes():
+    provider = _make_provider()
+    instructions = [
+        {"role": "system", "content": "Persona instructions"},
+        {"role": "developer", "content": "Developer instructions"},
+    ]
+    history = [{"role": "user", "content": "Small old question"} for _ in range(40)]
+    # The large attachment appears late: counting messages would retain it.
+    history.append(
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "image_url",
+                    "image_url": {"url": "data:image/png;base64," + "a" * 100_000},
+                }
+            ],
+        }
+    )
+    current_turn = [
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "image_url",
+                    "image_url": {"url": "data:image/png;base64,current"},
+                }
+            ],
+        },
+        {"role": "assistant", "tool_calls": [{"id": "current-call"}]},
+        {"role": "tool", "tool_call_id": "current-call", "content": "Current result"},
+    ]
+    contexts = copy.deepcopy([*instructions, *history, *current_turn])
+    payloads = {"messages": contexts}
+    error = APIStatusError(
+        "Request body exceeds the chat ingest budget (max 35 MB).",
+        response=httpx.Response(
+            413, request=httpx.Request("POST", "https://example.com")
+        ),
+        body=None,
+    )
+    try:
+        await provider._handle_api_error(
+            error,
+            payloads=payloads,
+            context_query=contexts,
+            func_tool=None,
+            chosen_key="test-key",
+            available_api_keys=["test-key"],
+            retry_cnt=0,
+            max_retries=10,
+        )
+        assert payloads["messages"] == [*instructions, *current_turn]
+        assert len(history) == 41
     finally:
         await provider.terminate()
 
