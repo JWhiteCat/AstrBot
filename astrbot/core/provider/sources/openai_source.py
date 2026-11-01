@@ -1088,6 +1088,44 @@ class ProviderOpenAIOfficial(Provider):
         image_fallback_used: bool = False,
     ) -> tuple:
         """处理API错误并尝试恢复"""
+        status_code = getattr(e, "status_code", None)
+        if status_code is None:
+            status_code = getattr(getattr(e, "response", None), "status_code", None)
+        if status_code == 413:
+            user_indices = [
+                idx
+                for idx, record in enumerate(context_query)
+                if record.get("role") == "user"
+            ]
+            if len(user_indices) < 2:
+                logger.warning(
+                    "Request body exceeds the provider limit with no older turns "
+                    "to remove. Reduce attachments, tool output, or prompt size."
+                )
+                raise e
+            # Remove a complete old turn so tool calls and results stay together.
+            # Keep instructions and the latest user turn, including its attachments.
+            next_user_index = user_indices[1]
+            context_query[:] = [
+                record
+                for idx, record in enumerate(context_query)
+                if idx >= next_user_index
+                or record.get("role") in {"system", "developer"}
+            ]
+            payloads["messages"] = context_query
+            logger.warning(
+                "Request body exceeds the provider limit (HTTP 413). "
+                "Removed the oldest conversation turn before retrying."
+            )
+            return (
+                False,
+                chosen_key,
+                available_api_keys,
+                payloads,
+                context_query,
+                func_tool,
+                image_fallback_used,
+            )
         if "429" in str(e):
             logger.warning(
                 f"API 调用过于频繁，尝试使用其他 Key 重试。当前 Key: {chosen_key[:12]}",

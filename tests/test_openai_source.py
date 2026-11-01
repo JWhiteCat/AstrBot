@@ -1,12 +1,13 @@
 import base64
 import builtins
+import copy
 from io import BytesIO
 from pathlib import Path
 from types import SimpleNamespace
 
 import httpx
 import pytest
-from openai import AsyncAzureOpenAI, AsyncOpenAI
+from openai import APIStatusError, AsyncAzureOpenAI, AsyncOpenAI
 from openai.types.chat.chat_completion import ChatCompletion
 from openai.types.chat.chat_completion_chunk import ChatCompletionChunk
 from PIL import Image as PILImage
@@ -233,6 +234,105 @@ async def test_text_chat_passes_request_max_retries_to_query():
     await provider.text_chat(prompt="hello", request_max_retries=2)
 
     assert captured["request_max_retries"] == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("streaming", [False, True])
+async def test_request_body_too_large_retries_without_old_turns(monkeypatch, streaming):
+    provider = _make_provider()
+    contexts = [
+        {"role": "system", "content": "System instructions"},
+        {"role": "user", "content": "Old question"},
+        {"role": "assistant", "tool_calls": [{"id": "old-call"}]},
+        {"role": "tool", "tool_call_id": "old-call", "content": "Old result"},
+        {"role": "developer", "content": "Developer instructions"},
+        {"role": "user", "content": "Another old question"},
+        {"role": "assistant", "content": "Old answer"},
+        {"role": "user", "content": "Current question"},
+        {"role": "assistant", "tool_calls": [{"id": "current-call"}]},
+        {"role": "tool", "tool_call_id": "current-call", "content": "Current result"},
+    ]
+    original_contexts = copy.deepcopy(contexts)
+    attempts = []
+    error = APIStatusError(
+        "Request body exceeds the chat ingest budget (max 35 MB).",
+        response=httpx.Response(
+            413, request=httpx.Request("POST", "https://example.com")
+        ),
+        body=None,
+    )
+
+    async def fake_query(payloads, tools, **kwargs):
+        attempts.append(copy.deepcopy(payloads["messages"]))
+        if len(attempts) < 3:
+            raise error
+        return LLMResponse(role="assistant", completion_text="ok")
+
+    async def fake_query_stream(payloads, tools, **kwargs):
+        yield await fake_query(payloads, tools, **kwargs)
+
+    monkeypatch.setattr(provider, "_query", fake_query)
+    monkeypatch.setattr(provider, "_query_stream", fake_query_stream)
+    try:
+        if streaming:
+            responses = [
+                resp async for resp in provider.text_chat_stream(contexts=contexts)
+            ]
+            assert responses[-1].completion_text == "ok"
+        else:
+            response = await provider.text_chat(contexts=contexts)
+            assert response.completion_text == "ok"
+        assert attempts == [
+            original_contexts,
+            [original_contexts[0], *original_contexts[4:]],
+            [original_contexts[0], original_contexts[4], *original_contexts[7:]],
+        ]
+        assert contexts == original_contexts
+    finally:
+        await provider.terminate()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status_code", [400, 413])
+async def test_request_body_error_preserves_current_attachments(status_code):
+    provider = _make_provider()
+    contexts = [
+        {"role": "system", "content": "Instructions"},
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "Describe this image"},
+                {
+                    "type": "image_url",
+                    "image_url": {"url": "data:image/png;base64,abcd"},
+                },
+            ],
+        },
+    ]
+    original_contexts = copy.deepcopy(contexts)
+    error = APIStatusError(
+        "Request body rejected",
+        response=httpx.Response(
+            status_code, request=httpx.Request("POST", "https://example.com")
+        ),
+        body=None,
+    )
+    try:
+        with pytest.raises(APIStatusError) as exc_info:
+            await provider._handle_api_error(
+                error,
+                payloads={"messages": contexts},
+                context_query=contexts,
+                func_tool=None,
+                chosen_key="test-key",
+                available_api_keys=["test-key"],
+                retry_cnt=0,
+                max_retries=10,
+            )
+        assert exc_info.value is error
+        assert contexts == original_contexts
+    finally:
+        await provider.terminate()
 
 
 @pytest.mark.asyncio
