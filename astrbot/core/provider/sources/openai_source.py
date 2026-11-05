@@ -1276,6 +1276,7 @@ class ProviderOpenAIOfficial(Provider):
         if func_tool and not func_tool.empty():
             payloads["tool_choice"] = tool_choice
 
+        original_user_turns = sum(m.get("role") == "user" for m in context_query)
         llm_response = None
         max_retries = 10
         available_api_keys = self.api_keys.copy()
@@ -1326,6 +1327,9 @@ class ProviderOpenAIOfficial(Provider):
             if last_exception is None:
                 raise Exception("未知错误")
             raise last_exception
+        llm_response.context_removed_turns = original_user_turns - sum(
+            m.get("role") == "user" for m in context_query
+        )
         return llm_response
 
     async def text_chat_stream(
@@ -1358,6 +1362,7 @@ class ProviderOpenAIOfficial(Provider):
         if func_tool and not func_tool.empty():
             payloads["tool_choice"] = tool_choice
 
+        original_user_turns = sum(m.get("role") == "user" for m in context_query)
         max_retries = 10
         available_api_keys = self.api_keys.copy()
         chosen_key = random.choice(available_api_keys)
@@ -1377,6 +1382,10 @@ class ProviderOpenAIOfficial(Provider):
                     request_max_retries=request_max_retries,
                     **query_kwargs,
                 ):
+                    if not response.is_chunk:
+                        response.context_removed_turns = original_user_turns - sum(
+                            m.get("role") == "user" for m in context_query
+                        )
                     yield response
                 break
             except Exception as e:

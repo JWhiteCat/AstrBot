@@ -485,6 +485,9 @@ class LLMResponse:
     usage: TokenUsage | None = None
     """The usage of the response. For chunked responses, it's the usage of the chunk; for non-chunked responses, it's the usage of the response."""
 
+    context_removed_turns: int = 0
+    """Oldest provider-facing user turns removed during request recovery, relative to this request only."""
+
     def __init__(
         self,
         role: str,
@@ -504,6 +507,7 @@ class LLMResponse:
         is_chunk: bool = False,
         id: str | None = None,
         usage: TokenUsage | None = None,
+        context_removed_turns: int = 0,
     ) -> None:
         """初始化 LLMResponse
 
@@ -536,6 +540,7 @@ class LLMResponse:
         self.reasoning_signature = reasoning_signature
         self.raw_completion = raw_completion
         self.is_chunk = is_chunk
+        self.context_removed_turns = context_removed_turns
 
         if id is not None:
             self.id = id

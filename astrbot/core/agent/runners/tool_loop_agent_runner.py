@@ -536,13 +536,59 @@ class ToolLoopAgentRunner(BaseAgentRunner[TContext]):
                         return
                     if resp is None:
                         return
+                    self._apply_provider_context_truncation(resp)
                     yield resp
             finally:
                 await self._close_executor(stream)
         else:
             resp = await self._await_or_stop(self.provider.text_chat(**payload))
             if resp is not None:
+                self._apply_provider_context_truncation(resp)
                 yield resp
+
+    def _apply_provider_context_truncation(self, response: LLMResponse) -> None:
+        """Keep runtime and saved history aligned with provider recovery.
+
+        Args:
+            response: Final response reporting removed provider-facing user turns.
+
+        Returns:
+            None.
+        """
+        if response.is_chunk or response.context_removed_turns <= 0:
+            return
+        messages = self.run_context.messages
+        user_indices = [
+            i for i, message in enumerate(messages) if message.role == "user"
+        ]
+        if not user_indices:
+            return
+        modalities = self.provider.provider_config.get("modalities")
+        tools_as_users = bool(modalities and "tool_use" not in modalities)
+        removed_turns = response.context_removed_turns
+        cutoff = user_indices[-1]
+        for i, message in enumerate(messages):
+            if message.role == "user" or (tools_as_users and message.role == "tool"):
+                if removed_turns == 0:
+                    # Modality filtering can turn tool results into user messages.
+                    # Persist complete original turns, keeping the latest turn intact.
+                    cutoff = next(
+                        (index for index in user_indices if index >= i),
+                        user_indices[-1],
+                    )
+                    break
+                removed_turns -= 1
+        self.run_context.messages = [
+            message
+            for i, message in enumerate(messages)
+            if i >= cutoff or message.role == "system"
+        ]
+        logger.info(
+            "Applied provider context recovery to conversation history: "
+            "removed_user_turns=%s remaining_messages=%s",
+            response.context_removed_turns,
+            len(self.run_context.messages),
+        )
 
     async def _iter_llm_responses_with_fallback(
         self,
@@ -1517,6 +1563,7 @@ class ToolLoopAgentRunner(BaseAgentRunner[TContext]):
                     )
                 )
                 if requery_resp:
+                    self._apply_provider_context_truncation(requery_resp)
                     llm_resp = requery_resp
                     self._sanitize_malformed_tool_calls(llm_resp)
 
@@ -1549,6 +1596,7 @@ class ToolLoopAgentRunner(BaseAgentRunner[TContext]):
                         )
                     )
                     if repair_resp:
+                        self._apply_provider_context_truncation(repair_resp)
                         llm_resp = repair_resp
                         self._sanitize_malformed_tool_calls(llm_resp)
 

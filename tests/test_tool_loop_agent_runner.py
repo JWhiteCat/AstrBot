@@ -513,6 +513,178 @@ def _make_large_tool_result_text() -> str:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("streaming", [False, True])
+@pytest.mark.parametrize(
+    "modalities", [None, ["image", "tool_use"], ["image"], ["tool_use"]]
+)
+async def test_provider_recovery_is_saved_and_reused_next_turn(
+    monkeypatch, streaming, modalities, runner, mock_tool_executor, mock_hooks, tool_set
+):
+    import copy
+    import json
+
+    import httpx
+    from openai import APIStatusError
+
+    from astrbot.core.agent.message import CheckpointData
+    from astrbot.core.db.po import Conversation
+    from astrbot.core.pipeline.process_stage.method.agent_sub_stages.internal import (
+        InternalAgentSubStage,
+    )
+    from astrbot.core.provider.sources.openai_source import ProviderOpenAIOfficial
+
+    provider = ProviderOpenAIOfficial(
+        {
+            "id": "recovery-test",
+            "model": "composer-2.5[fast=true]",
+            "key": ["test-key"],
+            "modalities": modalities,
+        },
+        {},
+    )
+    history = []
+    for index in range(8):
+        history.extend(
+            [
+                {"role": "user", "content": f"old-{index}" + "x" * 1000},
+                {
+                    "role": "assistant",
+                    "tool_calls": [
+                        {
+                            "id": f"old-call-{index}",
+                            "type": "function",
+                            "function": {"name": "test_tool", "arguments": "{}"},
+                        }
+                    ],
+                },
+                {
+                    "role": "tool",
+                    "tool_call_id": f"old-call-{index}",
+                    "content": "old-result",
+                },
+                {"role": "_checkpoint", "content": {"id": f"old-checkpoint-{index}"}},
+            ]
+        )
+    original_history = copy.deepcopy(history)
+    attempts = []
+    tool_called = False
+
+    async def fake_query(payloads, func_tool, **kwargs):
+        nonlocal tool_called
+        attempts.append(copy.deepcopy(payloads["messages"]))
+        if "old-" in json.dumps(payloads["messages"]):
+            raise APIStatusError(
+                "Request body too large",
+                response=httpx.Response(
+                    413, request=httpx.Request("POST", "https://example.com")
+                ),
+                body=None,
+            )
+        if func_tool and not tool_called:
+            tool_called = True
+            return LLMResponse(
+                role="assistant",
+                tools_call_name=["test_tool"],
+                tools_call_args=[{"query": "test"}],
+                tools_call_ids=["current-call"],
+            )
+        return LLMResponse(role="assistant", completion_text="final")
+
+    async def fake_query_stream(payloads, func_tool, **kwargs):
+        response = await fake_query(payloads, func_tool, **kwargs)
+        yield LLMResponse(role="assistant", completion_text="chunk", is_chunk=True)
+        yield response
+
+    monkeypatch.setattr(provider, "_query", fake_query)
+    monkeypatch.setattr(provider, "_query_stream", fake_query_stream)
+    conversation = Conversation(platform_id="test", user_id="group", cid="conversation")
+    request = ProviderRequest(
+        prompt="current question",
+        system_prompt="Keep these instructions",
+        contexts=history,
+        func_tool=tool_set,
+        conversation=conversation,
+    )
+    try:
+        await runner.reset(
+            provider=provider,
+            request=request,
+            run_context=ContextWrapper(context=None),
+            tool_executor=mock_tool_executor,
+            agent_hooks=mock_hooks,
+            streaming=streaming,
+        )
+        current_message = runner.run_context.messages[-1]
+        current_message._checkpoint_after = CheckpointData(id="current-checkpoint")
+        current_message.content = [
+            TextPart(text="current question"),
+            ImageURLPart(
+                image_url=ImageURLPart.ImageURL(url="data:image/png;base64,dGVzdA==")
+            ),
+            TextPart(text="temporary").mark_as_temp(),
+        ]
+        async for _ in runner.step_until_done(4):
+            pass
+
+        assert runner.done()
+        assert history == original_history
+        assert runner.run_context.messages[0].role == "system"
+        assert runner.run_context.messages[1] is current_message
+        assert isinstance(current_message.content[1], ImageURLPart)
+        # All retries after the first successful request, including tool re-queries,
+        # must use the shorter runtime history.
+        first_success = next(
+            i for i, a in enumerate(attempts) if "old-" not in json.dumps(a)
+        )
+        assert first_success >= 2
+        assert all("old-" not in json.dumps(a) for a in attempts[first_success:])
+        if tool_called:
+            assert any(m.get("tool_call_id") == "current-call" for m in attempts[-1])
+
+        stage = InternalAgentSubStage()
+        stage.conv_manager = AsyncMock()
+        await stage._save_to_history(
+            SimpleNamespace(
+                unified_msg_origin="test:GroupMessage:group", get_extra=lambda key: None
+            ),
+            request,
+            runner.get_final_llm_resp(),
+            runner.run_context.messages,
+            runner.stats,
+        )
+        saved_history = stage.conv_manager.update_conversation.await_args.kwargs[
+            "history"
+        ]
+        assert "old-" not in json.dumps(saved_history)
+        assert "temporary" not in json.dumps(saved_history)
+        assert {
+            "role": "_checkpoint",
+            "content": {"id": "current-checkpoint"},
+        } in saved_history
+
+        attempts_before_next_turn = len(attempts)
+        await runner.reset(
+            provider=provider,
+            request=ProviderRequest(
+                prompt="next question",
+                system_prompt=request.system_prompt,
+                contexts=saved_history,
+                conversation=conversation,
+            ),
+            run_context=ContextWrapper(context=None),
+            tool_executor=mock_tool_executor,
+            agent_hooks=mock_hooks,
+            streaming=streaming,
+        )
+        async for _ in runner.step_until_done(1):
+            pass
+        assert len(attempts) == attempts_before_next_turn + 1
+        assert runner.get_final_llm_resp().context_removed_turns == 0
+    finally:
+        await provider.terminate()
+
+
+@pytest.mark.asyncio
 async def test_max_step_limit_functionality(
     runner, mock_provider, provider_request, mock_tool_executor, mock_hooks
 ):

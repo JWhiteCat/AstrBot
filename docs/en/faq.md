@@ -149,6 +149,12 @@ This is because the provider's API returned empty text. Try the following steps:
 5. Lower the maximum conversation count setting
 6. Switch to another model from the same provider / a different provider
 
+### Every Reply Hits HTTP 413 and Trims History Again
+
+OpenAI-compatible services may limit request body size in bytes, especially for histories containing images. On HTTP 413, AstrBot retries after removing older complete turns while keeping instructions and the latest turn, including its tool calls and results. After a successful request, subsequent calls in the same run and the saved conversation history use the reduced context. The next turn reuses that history; further trimming may still be needed as it grows.
+
+Removed turns are no longer saved in that conversation's history. If instructions or the latest turn alone exceed the limit, reduce attachments, tool output, or prompt size.
+
 ## Plugin Related
 
 ### Cannot Install Plugin

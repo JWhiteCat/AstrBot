@@ -269,7 +269,9 @@ async def test_request_body_too_large_retries_without_old_turns(monkeypatch, str
         return LLMResponse(role="assistant", completion_text="ok")
 
     async def fake_query_stream(payloads, tools, **kwargs):
-        yield await fake_query(payloads, tools, **kwargs)
+        response = await fake_query(payloads, tools, **kwargs)
+        yield LLMResponse(role="assistant", completion_text="chunk", is_chunk=True)
+        yield response
 
     monkeypatch.setattr(provider, "_query", fake_query)
     monkeypatch.setattr(provider, "_query_stream", fake_query_stream)
@@ -279,13 +281,58 @@ async def test_request_body_too_large_retries_without_old_turns(monkeypatch, str
                 resp async for resp in provider.text_chat_stream(contexts=contexts)
             ]
             assert responses[-1].completion_text == "ok"
+            assert [resp.context_removed_turns for resp in responses] == [0, 2]
         else:
             response = await provider.text_chat(contexts=contexts)
             assert response.completion_text == "ok"
+            assert response.context_removed_turns == 2
         assert attempts == [
             original_contexts,
             [original_contexts[0], original_contexts[4], *original_contexts[7:]],
         ]
+        assert contexts == original_contexts
+    finally:
+        await provider.terminate()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("streaming", [False, True])
+async def test_failed_request_recovery_does_not_mutate_caller_history(
+    monkeypatch, streaming
+):
+    provider = _make_provider()
+    contexts = [
+        {"role": "user", "content": "Old question"},
+        {"role": "assistant", "content": "Old answer"},
+        {"role": "user", "content": "Current question"},
+    ]
+    original_contexts = copy.deepcopy(contexts)
+    error = APIStatusError(
+        "Request body too large",
+        response=httpx.Response(
+            413, request=httpx.Request("POST", "https://example.com")
+        ),
+        body=None,
+    )
+    attempts = []
+
+    async def fake_query(payloads, tools, **kwargs):
+        attempts.append(copy.deepcopy(payloads["messages"]))
+        raise error
+
+    async def fake_query_stream(payloads, tools, **kwargs):
+        yield await fake_query(payloads, tools, **kwargs)
+
+    monkeypatch.setattr(provider, "_query", fake_query)
+    monkeypatch.setattr(provider, "_query_stream", fake_query_stream)
+    try:
+        with pytest.raises(APIStatusError):
+            if streaming:
+                async for _ in provider.text_chat_stream(contexts=contexts):
+                    pass
+            else:
+                await provider.text_chat(contexts=contexts)
+        assert attempts == [original_contexts, [original_contexts[-1]]]
         assert contexts == original_contexts
     finally:
         await provider.terminate()
