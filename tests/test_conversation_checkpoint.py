@@ -405,7 +405,10 @@ async def test_terminal_tool_result_with_checkpoint_uses_none_token_usage():
 
 
 @pytest.mark.asyncio
-async def test_empty_response_without_tool_result_skips_history_save():
+@pytest.mark.parametrize("history_truncated", [False, True])
+async def test_empty_response_without_tool_result_saves_only_context_recovery(
+    history_truncated,
+):
     conversation_manager = AsyncMock()
     stage = InternalAgentSubStage()
     stage.conv_manager = conversation_manager
@@ -427,6 +430,13 @@ async def test_empty_response_without_tool_result_skips_history_save():
         None,
         [Message(role="user", content="latest group observation")],
         runner_stats=None,
+        history_truncated=history_truncated,
     )
 
-    conversation_manager.update_conversation.assert_not_awaited()
+    if history_truncated:
+        conversation_manager.update_conversation.assert_awaited_once()
+        assert conversation_manager.update_conversation.await_args.kwargs["history"] == [
+            {"role": "user", "content": "latest group observation"}
+        ]
+    else:
+        conversation_manager.update_conversation.assert_not_awaited()

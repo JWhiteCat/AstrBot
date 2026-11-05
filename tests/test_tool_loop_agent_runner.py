@@ -514,11 +514,19 @@ def _make_large_tool_result_text() -> str:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("streaming", [False, True])
+@pytest.mark.parametrize("completion_text", ["final", ""])
 @pytest.mark.parametrize(
     "modalities", [None, ["image", "tool_use"], ["image"], ["tool_use"]]
 )
 async def test_provider_recovery_is_saved_and_reused_next_turn(
-    monkeypatch, streaming, modalities, runner, mock_tool_executor, mock_hooks, tool_set
+    monkeypatch,
+    streaming,
+    completion_text,
+    modalities,
+    runner,
+    mock_tool_executor,
+    mock_hooks,
+    tool_set,
 ):
     import copy
     import json
@@ -588,7 +596,7 @@ async def test_provider_recovery_is_saved_and_reused_next_turn(
                 tools_call_args=[{"query": "test"}],
                 tools_call_ids=["current-call"],
             )
-        return LLMResponse(role="assistant", completion_text="final")
+        return LLMResponse(role="assistant", completion_text=completion_text)
 
     async def fake_query_stream(payloads, func_tool, **kwargs):
         response = await fake_query(payloads, func_tool, **kwargs)
@@ -627,6 +635,7 @@ async def test_provider_recovery_is_saved_and_reused_next_turn(
             pass
 
         assert runner.done()
+        assert runner.provider_context_truncated
         assert history == original_history
         assert runner.run_context.messages[0].role == "system"
         assert runner.run_context.messages[1] is current_message
@@ -651,6 +660,7 @@ async def test_provider_recovery_is_saved_and_reused_next_turn(
             runner.get_final_llm_resp(),
             runner.run_context.messages,
             runner.stats,
+            history_truncated=runner.provider_context_truncated,
         )
         saved_history = stage.conv_manager.update_conversation.await_args.kwargs[
             "history"
@@ -680,6 +690,7 @@ async def test_provider_recovery_is_saved_and_reused_next_turn(
             pass
         assert len(attempts) == attempts_before_next_turn + 1
         assert runner.get_final_llm_resp().context_removed_turns == 0
+        assert not runner.provider_context_truncated
     finally:
         await provider.terminate()
 

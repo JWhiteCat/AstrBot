@@ -281,6 +281,7 @@ class ToolLoopAgentRunner(BaseAgentRunner[TContext]):
             if fallback_id:
                 seen_provider_ids.add(fallback_id)
         self.final_llm_resp = None
+        self.provider_context_truncated = False
         self._state = AgentState.IDLE
         self.tool_executor = tool_executor
         self.agent_hooks = agent_hooks
@@ -583,6 +584,7 @@ class ToolLoopAgentRunner(BaseAgentRunner[TContext]):
             for i, message in enumerate(messages)
             if i >= cutoff or message.role == "system"
         ]
+        self.provider_context_truncated = True
         logger.info(
             "Applied provider context recovery to conversation history: "
             "removed_user_turns=%s remaining_messages=%s",

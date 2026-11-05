@@ -312,6 +312,7 @@ class InternalAgentSubStage(Stage):
                                 all_messages=agent_runner.run_context.messages,
                                 runner_stats=agent_runner.stats,
                                 user_aborted=agent_runner.was_aborted(),
+                                history_truncated=agent_runner.provider_context_truncated,
                             )
 
                     elif streaming_response and not stream_to_general:
@@ -404,6 +405,7 @@ class InternalAgentSubStage(Stage):
                             all_messages=agent_runner.run_context.messages,
                             runner_stats=agent_runner.stats,
                             user_aborted=agent_runner.was_aborted(),
+                            history_truncated=agent_runner.provider_context_truncated,
                         )
 
                     asyncio.create_task(
@@ -450,6 +452,7 @@ class InternalAgentSubStage(Stage):
         all_messages: list[Message],
         runner_stats: AgentStats | None,
         user_aborted: bool = False,
+        history_truncated: bool = False,
     ) -> None:
         if not req or not req.conversation:
             return
@@ -476,8 +479,16 @@ class InternalAgentSubStage(Stage):
                         content=CheckpointData(id=checkpoint_id),
                     ).model_dump()
                 )
-            if has_checkpoint or (llm_response is None and req.tool_calls_result):
-                token_usage = None if has_checkpoint else req.conversation.token_usage
+            if (
+                has_checkpoint
+                or (llm_response is None and req.tool_calls_result)
+                or history_truncated
+            ):
+                token_usage = (
+                    None
+                    if has_checkpoint or history_truncated
+                    else req.conversation.token_usage
+                )
                 await self.conv_manager.update_conversation(
                     event.unified_msg_origin,
                     req.conversation.cid,
@@ -500,6 +511,7 @@ class InternalAgentSubStage(Stage):
             not llm_response.completion_text
             and not req.tool_calls_result
             and not user_aborted
+            and not history_truncated
         ):
             logger.debug("The LLM response is empty; not saving a record.")
             return

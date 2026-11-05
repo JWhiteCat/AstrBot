@@ -153,7 +153,7 @@ This is because the provider's API returned empty text. Try the following steps:
 
 OpenAI-compatible services may limit request body size in bytes, especially for histories containing images. On HTTP 413, AstrBot retries after removing older complete turns while keeping instructions and the latest turn, including its tool calls and results. After a successful request, subsequent calls in the same run and the saved conversation history use the reduced context. The next turn reuses that history; further trimming may still be needed as it grows.
 
-Removed turns are no longer saved in that conversation's history. If instructions or the latest turn alone exceed the limit, reduce attachments, tool output, or prompt size.
+The reduced history is also saved when the model chooses to stay silent after a successful request. Removed turns are no longer saved in that conversation's history. If instructions or the latest turn alone exceed the limit, reduce attachments, tool output, or prompt size.
 
 ## Plugin Related
 
