@@ -281,6 +281,9 @@ async def collect_initial_request(
             ):
                 req.prompt = prefix_text[len(provider_wake_prefix) :]
 
+            if not req.prompt.strip():
+                req.prompt = event.get_extra("_empty_group_mention_prompt", "")
+
             # media files attachments
             for comp in event.message_obj.message:
                 if isinstance(comp, Image):

@@ -139,6 +139,7 @@ class InternalAgentSubStage(Stage):
                 and not has_valid_message
                 and not has_media_content
                 and not has_reply
+                and not event.get_extra("_empty_group_mention_prompt")
             ):
                 logger.debug("skip llm request: empty message and no provider_request")
                 return

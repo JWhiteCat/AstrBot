@@ -4,11 +4,14 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from astrbot.api.message_components import Json, Plain
+from astrbot.api.message_components import At, Image, Json, Plain
 from astrbot.api.provider import LLMResponse
 from astrbot.builtin_stars.astrbot.group_chat_context import GroupChatContext
 from astrbot.builtin_stars.astrbot.main import Main
+from astrbot.core.astr_main_agent.config import MainAgentBuildConfig
+from astrbot.core.astr_main_agent.request import collect_initial_request
 from astrbot.core.message.message_event_result import MessageChain
+from astrbot.core.pipeline.process_stage.method.agent_sub_stages import internal
 from astrbot.core.platform.message_type import MessageType
 
 
@@ -53,6 +56,102 @@ def make_event(
     event.get_extra.side_effect = get_extra
     event.set_extra.side_effect = set_extra
     return event
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("empty_text", [None, "", " \n"])
+async def test_bare_group_mention_continues_recent_group_context(
+    empty_text, monkeypatch
+):
+    """A bare mention must collect earlier group messages through normal hooks.
+
+    Args:
+        empty_text: Optional empty text component supplied by the adapter.
+        monkeypatch: Fixture for stopping before any external model request.
+    """
+    conversation = SimpleNamespace(cid="cid-1", history="[]")
+    main = make_main_with_conversation_manager(
+        SimpleNamespace(
+            get_curr_conversation_id=AsyncMock(return_value="cid-1"),
+            get_conversation=AsyncMock(return_value=conversation),
+        )
+    )
+    main.context.get_config.return_value = {
+        "platform_settings": {},
+        "wake_prefix": ["/"],
+        "provider_ltm_settings": {
+            "group_icl_enable": True,
+            "active_reply": {"enable": False},
+        },
+    }
+    group_context = GroupChatContext(MagicMock(), main.context)
+    group_context.cfg = MagicMock(return_value={"group_message_max_cnt": 100})
+    group_context.need_active_reply = AsyncMock(return_value=False)
+    group_context._format_message = AsyncMock(
+        side_effect=["[Alice]: Why are game maps so complex?", "[Alice]: @bot"]
+    )
+    main.group_chat_context = group_context
+    previous = make_event()
+    previous.get_message_type.return_value = MessageType.GROUP_MESSAGE
+    await group_context.handle_message(previous)
+
+    event = make_event()
+    event.message_str = ""
+    event.get_message_type.return_value = MessageType.GROUP_MESSAGE
+    event.get_self_id.return_value = "bot"
+    components = [At(qq="bot")]
+    if empty_text is not None:
+        components.append(Plain(empty_text))
+    event.message_obj.message = components
+    event.get_messages.return_value = components
+
+    assert [item async for item in main.handle_empty_mention(event)] == []
+    assert [item async for item in main.on_message(event)] == []
+    stage = internal.InternalAgentSubStage()
+    stage.streaming_response = False
+    stage.show_reasoning = False
+    event.send_typing = AsyncMock()
+    event.stop_typing = AsyncMock()
+    waiting_hook = AsyncMock(return_value=True)
+    monkeypatch.setattr(internal, "call_event_hook", waiting_hook)
+    monkeypatch.setattr(internal, "try_capture_follow_up", lambda event: None)
+    assert [item async for item in stage.process(event, "")] == []
+    waiting_hook.assert_awaited_once()
+
+    req, _ = await collect_initial_request(
+        event, main.context, MainAgentBuildConfig(tool_call_timeout=60)
+    )
+    assert req is not None
+    await group_context.on_req_llm(event, req)
+
+    assert req.prompt == event.get_extra("_empty_group_mention_prompt")
+    assert req.prompt
+    assert req.conversation is conversation
+    assert "Why are game maps so complex?" in req.extra_user_content_parts[0].text
+    assert event.message_str == ""
+    assert event.message_obj.message == components
+    event.stop_event.assert_not_called()
+    event.request_llm.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "components",
+    [[At(qq="other")], [At(qq="bot"), Plain("hello")], [At(qq="bot"), Image(file="x")]],
+)
+async def test_contextual_mention_does_not_replace_other_message_types(components):
+    """Preserve other mentions and explicit text or media inputs.
+
+    Args:
+        components: A message that should not become a contextual bare mention.
+    """
+    main = make_main_with_conversation_manager(SimpleNamespace())
+    main.context.get_config.return_value = {"platform_settings": {}, "wake_prefix": []}
+    event = make_event()
+    event.get_self_id.return_value = "bot"
+    event.get_messages.return_value = components
+    assert [item async for item in main.handle_empty_mention(event)] == []
+    assert event.get_extra("_empty_group_mention_prompt") is None
 
 
 @pytest.mark.asyncio

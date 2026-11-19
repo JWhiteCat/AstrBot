@@ -40,9 +40,17 @@ class Main(star.Star):
 
     @filter.event_message_type(filter.EventMessageType.ALL, priority=maxsize - 1)
     async def handle_empty_mention(self, event: AstrMessageEvent):
-        """处理只有一个 @ 或仅有唤醒前缀的消息，并等待用户下一条内容。"""
+        """Continue group context on a bare mention, or wait for private input.
+
+        Args:
+            event: Incoming message, possibly containing empty text components.
+        """
         try:
-            messages = event.get_messages()
+            messages = [
+                comp
+                for comp in event.get_messages()
+                if not (isinstance(comp, Comp.Plain) and not comp.text.strip())
+            ]
             cfg = self.context.get_config(umo=event.unified_msg_origin)
             p_settings = cfg["platform_settings"]
             wake_prefix = cfg.get("wake_prefix", [])
@@ -60,6 +68,24 @@ class Main(star.Star):
             )
 
             if not (is_empty_mention or is_wake_prefix_only):
+                return
+
+            if (
+                is_empty_mention
+                and event.get_message_type() == MessageType.GROUP_MESSAGE
+                and p_settings.get("empty_mention_waiting_need_reply", True)
+            ):
+                # Defer to the normal pipeline so all context and policy hooks run.
+                # Keep the original message intact for history and plugin admission.
+                event.set_extra(
+                    "_empty_group_mention_prompt",
+                    "用户在群聊中仅 @ 了你，没有附加正文。请结合提供的最近群聊上下文，"
+                    "优先接续这位用户在 @ 之前刚说的话或提出的问题，自然地回答。"
+                    "其他成员的发言只作为背景，不要误当作这位用户的问题。"
+                    "如果没有相关上下文或无法确定其意图，再简短询问对方想聊什么；"
+                    "不要编造未提供的聊天记录。",
+                )
+                event.is_at_or_wake_command = True
                 return
 
             if p_settings.get("empty_mention_waiting_need_reply", True):
@@ -188,7 +214,7 @@ class Main(star.Star):
     async def on_message(self, event: AstrMessageEvent):
         """群聊上下文感知"""
         message_components = _iter_message_components(event)
-        has_context_content = False
+        has_context_content = bool(event.get_extra("_empty_group_mention_prompt"))
         for comp in message_components:
             if isinstance(comp, Plain | Image | Json):
                 has_context_content = True
